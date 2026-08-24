@@ -1,56 +1,143 @@
 """
-TfL Data Capture → Google Cloud Storage
-=========================================
-Captures live data from 4 TfL API endpoints and writes each
-snapshot as a JSON file to a GCS bucket.
+TfL Data Capture → Google Cloud Storage  (v2 — 7 endpoints)
+=============================================================
+Captures live data from 7 TfL API endpoints every time it runs.
+Designed to run every 5 minutes via GitHub Actions cron.
 
-Why JSON files instead of CSV appending?
-  - Each run writes ONE small file per endpoint (e.g. line_status_2025-03-15T14:32:00Z.json)
-  - Files never grow large — no 100MB GitHub limit problem
-  - GCS is designed for this pattern (object storage = files, not databases)
-  - When ready to load into Snowflake, one COPY INTO command reads all files at once
-  - If one run fails, you lose only that run's file — not a corrupted CSV
+Endpoints captured:
+  ALREADY IN V1:
+  1.  Line Status          — Tube/DLR/Overground/Elizabeth disruptions
+  2.  BikePoint            — Santander Cycles dock availability (800+ stations)
+  3.  Road Disruptions     — Active road closures and roadworks
+  4.  Air Quality          — London borough air quality index
 
-File naming pattern:
-  gs://your-bucket/tfl/line_status/2025/03/15/line_status_2025-03-15T14:32:00Z.json
-  gs://your-bucket/tfl/bikepoints/2025/03/15/bikepoints_2025-03-15T14:32:00Z.json
-  gs://your-bucket/tfl/road_disruptions/2025/03/15/road_disruptions_2025-03-15T14:32:00Z.json
-  gs://your-bucket/tfl/air_quality/2025/03/15/air_quality_2025-03-15T14:32:00Z.json
+  NEW IN V2:
+  5.  Tube Arrivals        — Live next-train predictions per line
+  6.  Bus Arrivals         — Live bus arrival predictions at 50 busiest stops
+  7.  Road Traffic Speeds  — Live congestion speeds on TfL Red Routes
 
-The date-partitioned folder structure (year/month/day) means when you load
-into Snowflake later, you can load one day or one month at a time cleanly.
+Storage pattern:
+  Each run writes one JSON file per endpoint to GCS.
+  Path: gs://BUCKET/tfl/{endpoint}/{YYYY}/{MM}/{DD}/{endpoint}_{captured_at}.json
+  Files are small (KB to a few MB each) and never grow large.
+  All rows share the same captured_at timestamp for the entire run.
 
-Environment variables required (set as GitHub Secrets):
-  TFL_APP_KEY        — your TfL API key
-  GCS_BUCKET_NAME    — your GCS bucket name (without gs:// prefix)
-  GCP_CREDENTIALS    — your GCP service account JSON key (full JSON string)
+Environment variables (GitHub Secrets):
+  TFL_APP_KEY       — TfL API primary key
+  GCS_BUCKET_NAME   — GCS bucket name (no gs:// prefix)
+  GCP_CREDENTIALS   — Full GCP service account JSON string
 """
 
 import os
 import json
 import requests
-import tempfile
 from datetime import datetime, timezone
-from pathlib import Path
 
 
 # ─── CONFIG ──────────────────────────────────────────────────────────────────
 
-TFL_BASE_URL   = "https://api.tfl.gov.uk"
-TFL_APP_KEY    = os.environ.get("TFL_APP_KEY", "")
-GCS_BUCKET     = os.environ.get("GCS_BUCKET_NAME", "")
+TFL_BASE = "https://api.tfl.gov.uk"
+
+TFL_APP_KEY  = os.environ.get("TFL_APP_KEY", "")
+GCS_BUCKET   = os.environ.get("GCS_BUCKET_NAME", "")
+
+# ── Tube lines to capture arrivals for ───────────────────────────────────────
+# All currently operating lines. Each call returns next trains on that line.
+TUBE_LINES = [
+    "bakerloo", "central", "circle", "district",
+    "hammersmith-city", "jubilee", "metropolitan",
+    "northern", "piccadilly", "victoria",
+    "waterloo-city", "elizabeth", "dlr",
+    "london-overground"
+]
+
+# ── Busiest London bus stops (NaPTAN IDs) ────────────────────────────────────
+# Curated list of the 50 busiest bus stops across London — major interchanges,
+# transport hubs, and high-footfall locations. Covers all zones and areas.
+# Source: TfL passenger count data + known interchange hubs.
+# These IDs work directly with /StopPoint/{id}/Arrivals
+BUS_STOPS = {
+    # Zone 1 — Central London
+    "490000173RF": "Oxford Circus (Margaret St)",
+    "490000173RA": "Oxford Circus (Regent St)",
+    "490000173RG": "Oxford Circus (Argyll St)",
+    "490004733S":  "Victoria Station (Terminus Pl)",
+    "490004733N":  "Victoria Station (Buckingham Palace Rd)",
+    "490000077A":  "Liverpool Street Station",
+    "490000077B":  "Liverpool Street (Bishopsgate)",
+    "490000152A":  "Paddington Station (Praed St)",
+    "490000152B":  "Paddington (London St)",
+    "490000083C":  "London Bridge Station (Tooley St)",
+    "490000083E":  "London Bridge (Borough High St)",
+    "490000072A":  "King's Cross Station (Euston Rd)",
+    "490000072B":  "King's Cross (York Way)",
+    "490000230VB": "Waterloo Station (York Rd)",
+    "490000230VA": "Waterloo (Waterloo Rd)",
+    "490000235A":  "Westminster Station (Bridge St)",
+    "490000235B":  "Westminster (Parliament Sq)",
+    "490000091D":  "Marble Arch",
+    "490000070A":  "Holborn Station",
+    "490000125A":  "Oxford Street / New Bond St",
+
+    # Zone 1/2 — Inner London hubs
+    "490000117A":  "Elephant & Castle Station",
+    "490000117B":  "Elephant & Castle (New Kent Rd)",
+    "490000060B":  "Hammersmith Bus Station",
+    "490000060A":  "Hammersmith (King St)",
+    "490000222A":  "Vauxhall Bus Station",
+    "490000222B":  "Vauxhall (South Lambeth Rd)",
+    "490000121A":  "Old Street Station",
+    "490000130A":  "Aldgate Bus Station",
+    "490000007A":  "Angel Station (Upper St)",
+    "490000009A":  "Bank Station (Queen Victoria St)",
+
+    # Zone 2 — Major hubs
+    "490001080S":  "Stratford Bus Station",
+    "490001080N":  "Stratford (Great Eastern Rd)",
+    "490000096B":  "Mile End Station",
+    "490000102A":  "New Cross Gate Station",
+    "490000158A":  "Peckham Bus Station",
+    "490000174A":  "Brixton Station (Brixton Rd)",
+    "490000174B":  "Brixton (Effra Rd)",
+    "490000200A":  "Tooting Broadway Station",
+    "490000052A":  "Clapham Junction Station",
+    "490000052B":  "Clapham Junction (St John's Hill)",
+
+    # Zone 2/3 — Outer hubs
+    "490000135A":  "Lewisham Bus Station",
+    "490000019A":  "Barking Station",
+    "490000041A":  "Camden Town Station (Camden High St)",
+    "490000041B":  "Camden Town (Buck St)",
+    "490000103A":  "North Greenwich Bus Station",
+    "490000160A":  "Putney Bridge Station",
+    "490000168B":  "Richmond Bus Station",
+    "490000197A":  "Shepherd's Bush (Uxbridge Rd)",
+    "490000197B":  "Shepherd's Bush (Goldhawk Rd)",
+
+    # Zone 3+ — Outer London
+    "490000218A":  "Uxbridge Bus Station",
+    "490000016A":  "Croydon (George St)",
+}
+
+# ── TfL-managed roads (Red Routes) to capture speed data for ─────────────────
+# Red Routes are the 5% of London roads that carry 30% of traffic.
+# TfL manages these directly and publishes speed data for them.
+ROAD_IDS = [
+    "A1", "A2", "A3", "A4", "A5",
+    "A10", "A11", "A12", "A13", "A20",
+    "A21", "A23", "A24", "A30", "A40",
+    "A41", "A316", "A406",  # North Circular
+    "A205",                  # South Circular
+]
+
 
 # ─── GCS SETUP ───────────────────────────────────────────────────────────────
 
-def get_gcs_client():
+def get_gcs_bucket():
     """
-    Authenticates to Google Cloud Storage using a service account key.
-
-    The service account JSON is stored as a GitHub Secret (GCP_CREDENTIALS).
-    We write it to a temp file because the GCS library expects a file path,
-    not a raw string.
-
-    Returns a GCS client and the bucket object, or (None, None) if it fails.
+    Authenticates to GCS using the service account JSON stored in
+    GCP_CREDENTIALS environment variable (GitHub Secret).
+    Returns the bucket object or None if authentication fails.
     """
     try:
         from google.cloud import storage
@@ -58,128 +145,88 @@ def get_gcs_client():
 
         creds_json = os.environ.get("GCP_CREDENTIALS", "")
         if not creds_json:
-            print("  ERROR: GCP_CREDENTIALS environment variable not set")
-            return None, None
+            print("  ERROR: GCP_CREDENTIALS not set")
+            return None
 
-        # Parse the JSON credentials
-        creds_dict = json.loads(creds_json)
-
-        # Build credentials object directly from dict (no temp file needed)
+        creds_dict  = json.loads(creds_json)
         credentials = service_account.Credentials.from_service_account_info(
             creds_dict,
             scopes=["https://www.googleapis.com/auth/cloud-platform"]
         )
-
         client = storage.Client(
             project=creds_dict.get("project_id"),
             credentials=credentials
         )
-        bucket = client.bucket(GCS_BUCKET)
-        return client, bucket
+        return client.bucket(GCS_BUCKET)
 
     except json.JSONDecodeError:
         print("  ERROR: GCP_CREDENTIALS is not valid JSON")
-        return None, None
+        return None
     except Exception as e:
-        print(f"  ERROR setting up GCS client: {e}")
-        return None, None
+        print(f"  ERROR connecting to GCS: {e}")
+        return None
 
 
-def upload_to_gcs(bucket, data: list | dict, endpoint_name: str, captured_at: str):
+def upload(bucket, rows: list, endpoint_name: str, captured_at: str):
     """
-    Uploads a JSON file to GCS.
+    Uploads a list of rows as a single JSON file to GCS.
 
-    File path structure:
-      tfl/{endpoint_name}/{year}/{month}/{day}/{endpoint_name}_{captured_at}.json
+    File path: tfl/{endpoint}/{year}/{month}/{day}/{endpoint}_{captured_at}.json
+    File contents: { endpoint, captured_at, row_count, rows: [...] }
 
-    Example:
-      tfl/line_status/2025/03/15/line_status_2025-03-15T14:32:00Z.json
-
-    Each file contains a JSON array of rows, all sharing the same captured_at.
-    This structure means:
-      - You can list all files for a given day easily
-      - Snowflake can load by date partition (COPY INTO for just March data etc.)
-      - Individual files are small (a few KB to a few MB each)
-      - Failed runs = missing files, not corrupted data
+    One file per endpoint per run. Small, self-describing, date-partitioned.
+    Never grows large. Easy to COPY INTO Snowflake later by date range.
     """
     if not bucket:
-        return False
+        return
 
     try:
-        # Parse the timestamp to build folder path
-        # captured_at format: 2025-03-15T14:32:00Z
-        dt = datetime.strptime(captured_at, "%Y-%m-%dT%H:%M:%SZ")
-        year  = dt.strftime("%Y")
-        month = dt.strftime("%m")
-        day   = dt.strftime("%d")
-
-        # Build the GCS object path (this becomes the "file path" inside the bucket)
-        gcs_path = f"tfl/{endpoint_name}/{year}/{month}/{day}/{endpoint_name}_{captured_at}.json"
-
-        # Wrap the data in an envelope with metadata
-        # This makes the file self-describing — you know what it is just by reading it
+        dt    = datetime.strptime(captured_at, "%Y-%m-%dT%H:%M:%SZ")
+        path  = (
+            f"tfl/{endpoint_name}/"
+            f"{dt.strftime('%Y')}/{dt.strftime('%m')}/{dt.strftime('%d')}/"
+            f"{endpoint_name}_{captured_at}.json"
+        )
         payload = {
             "endpoint":    endpoint_name,
             "captured_at": captured_at,
-            "row_count":   len(data) if isinstance(data, list) else 1,
-            "rows":        data if isinstance(data, list) else [data]
+            "row_count":   len(rows),
+            "rows":        rows,
         }
-
-        # Upload as JSON string
-        blob = bucket.blob(gcs_path)
-        blob.upload_from_string(
-            data=json.dumps(payload, indent=2, ensure_ascii=False),
+        bucket.blob(path).upload_from_string(
+            json.dumps(payload, indent=2, ensure_ascii=False),
             content_type="application/json"
         )
-
-        row_count = payload["row_count"]
-        print(f"  ✓ Uploaded {row_count} rows → gs://{GCS_BUCKET}/{gcs_path}")
-        return True
+        print(f"  ✓ {len(rows):>6,} rows  →  gs://{GCS_BUCKET}/{path}")
 
     except Exception as e:
-        print(f"  ERROR uploading to GCS: {e}")
-        return False
+        print(f"  ERROR uploading {endpoint_name}: {e}")
 
 
-# ─── TfL API HELPERS ─────────────────────────────────────────────────────────
+# ─── TfL API HELPER ──────────────────────────────────────────────────────────
 
-def get_timestamp() -> str:
-    """
-    Returns current UTC time as ISO 8601 string.
-    e.g. 2025-03-15T14:32:07Z
-    Used as captured_at on every single row — this is how you reconstruct
-    when each snapshot was taken when loading into Snowflake later.
-    """
-    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
-
-
-def call_tfl(endpoint: str, params: dict = {}) -> list | dict | None:
+def tfl_get(endpoint: str, params: dict = {}) -> list | dict | None:
     """
     Makes a GET request to the TfL Unified API.
-    Returns parsed JSON or None if the request fails.
-    Handles timeouts, HTTP errors, and JSON decode errors gracefully
-    so one bad API response doesn't crash the whole run.
+    Always appends the API key. Returns parsed JSON or None on failure.
+    Handles timeouts and HTTP errors gracefully — one bad call won't
+    crash the whole run.
     """
-    url = f"{TFL_BASE_URL}{endpoint}"
-    if TFL_APP_KEY:
-        params = {**params, "app_key": TFL_APP_KEY}
+    url    = f"{TFL_BASE}{endpoint}"
+    params = {**params, **({"app_key": TFL_APP_KEY} if TFL_APP_KEY else {})}
 
     try:
-        response = requests.get(url, params=params, timeout=20)
-        response.raise_for_status()
-        return response.json()
-
+        r = requests.get(url, params=params, timeout=20)
+        r.raise_for_status()
+        return r.json()
     except requests.exceptions.Timeout:
-        print(f"  TIMEOUT calling {endpoint}")
+        print(f"    TIMEOUT: {endpoint}")
         return None
     except requests.exceptions.HTTPError as e:
-        print(f"  HTTP {e.response.status_code} from {endpoint}")
+        print(f"    HTTP {e.response.status_code}: {endpoint}")
         return None
-    except requests.exceptions.RequestException as e:
-        print(f"  REQUEST ERROR {endpoint}: {e}")
-        return None
-    except json.JSONDecodeError:
-        print(f"  JSON DECODE ERROR from {endpoint}")
+    except Exception as e:
+        print(f"    ERROR: {endpoint} — {e}")
         return None
 
 
@@ -187,112 +234,78 @@ def call_tfl(endpoint: str, params: dict = {}) -> list | dict | None:
 
 def capture_line_status(bucket, captured_at: str):
     """
-    Captures current status of all Tube, DLR, Overground, and Elizabeth line services.
+    STATUS of all Tube, DLR, Overground, and Elizabeth line services.
 
-    Each line can have multiple concurrent status entries — for example the
-    Central line might show 'Good Service' on most of the line but 'Part
-    Closure' between two stations. We flatten these so each status entry
-    becomes its own row, linked by captured_at and line_id.
+    severity scale: 10 = Good Service · 6 = Minor Delays · 5 = Severe Delays
+                    4 = Part Closure · 0 = Suspended · 20 = Special Service
+    Lower = worse (except 20). 10 = perfect normal operation.
 
-    Key field — status_severity (integer):
-      10  = Good Service  (normal operation)
-      6   = Minor Delays
-      5   = Severe Delays
-      4   = Part Closure
-      3   = Part Suspended
-      0   = Suspended     (full line closure)
-      20  = Special Service (e.g. planned engineering weekend)
-    Lower number = worse. 10 = perfect. This is the core KPI for line performance.
+    Each line can have multiple simultaneous statuses (e.g. good service
+    on most of the line + part closure on one branch). We flatten them
+    so each status entry is its own row.
 
-    Frequency: every 5 minutes
-    Typical rows per call: 15–25 (one per status entry per line)
+    ~15–25 rows per call.
     """
-    print("Capturing line status...")
-
+    print("  Line status...")
     modes = "tube,dlr,overground,elizabeth-line"
-    data  = call_tfl(f"/Line/Mode/{modes}/Status")
+    data  = tfl_get(f"/Line/Mode/{modes}/Status")
     if not data:
         return
 
     rows = []
     for line in data:
-        line_id   = line.get("id", "")
-        line_name = line.get("name", "")
-        mode_name = line.get("modeName", "")
-
+        line_id, line_name, mode = (
+            line.get("id", ""),
+            line.get("name", ""),
+            line.get("modeName", ""),
+        )
         for status in line.get("lineStatuses", [{}]):
-            disruption = status.get("disruption") or {}
-
-            # validityPeriods tells us when this status started and when it
-            # is expected to end — useful for calculating disruption duration
-            validity   = (status.get("validityPeriods") or [{}])[0]
-
+            dis      = status.get("disruption") or {}
+            validity = (status.get("validityPeriods") or [{}])[0]
             rows.append({
                 "captured_at":          captured_at,
                 "line_id":              line_id,
                 "line_name":            line_name,
-                "mode_name":            mode_name,
+                "mode_name":            mode,
                 "status_severity":      status.get("statusSeverity"),
                 "status_description":   status.get("statusSeverityDescription", ""),
                 "reason":               status.get("reason", ""),
-                "disruption_category":  disruption.get("categoryDescription", ""),
-                "disruption_type":      disruption.get("category", ""),
-                "affected_routes":      ", ".join(
-                                            r.get("name", "")
-                                            for r in disruption.get("affectedRoutes", [])
-                                        ),
-                "affected_stops":       ", ".join(
-                                            s.get("name", "")
-                                            for s in disruption.get("affectedStops", [])
-                                        ),
+                "disruption_category":  dis.get("categoryDescription", ""),
+                "disruption_type":      dis.get("category", ""),
+                "affected_routes":      ", ".join(r.get("name","") for r in dis.get("affectedRoutes",[])),
+                "affected_stops":       ", ".join(s.get("name","") for s in dis.get("affectedStops",[])),
                 "valid_from":           validity.get("fromDate", ""),
                 "valid_to":             validity.get("toDate", ""),
             })
-
-    upload_to_gcs(bucket, rows, "line_status", captured_at)
+    upload(bucket, rows, "line_status", captured_at)
 
 
 def capture_bikepoints(bucket, captured_at: str):
     """
-    Captures real-time availability at all 800+ Santander Cycles docking stations.
+    REAL-TIME AVAILABILITY at all 800+ Santander Cycles docking stations.
 
-    This is the highest-volume endpoint — ~800 rows every 5 minutes.
-    Each row = one station snapshot at one moment in time.
+    Key fields:
+      bikes_available  — bikes ready to hire right now
+      docks_available  — empty docks to return a bike
+      occupancy_pct    — bikes / total_docks * 100 (derived)
+      e_bikes_available — electric bikes specifically
 
-    The additionalProperties array in the TfL response contains the actual
-    availability numbers. It's a list of {key, value} dicts — we convert it
-    to a lookup dict for clean access.
-
-    Key analytical fields:
-      bikes_available  — how many bikes can be hired right now
-      docks_available  — how many docks are free to return a bike
-      total_docks      — full capacity of this station
-      occupancy_pct    — bikes_available / total_docks * 100 (we calculate this)
-
-    Frequency: every 5 minutes
-    Typical rows per call: ~800 stations
+    ~800 rows per call. Highest volume endpoint (~200MB/month in GCS).
     """
-    print("Capturing BikePoints...")
-
-    data = call_tfl("/BikePoint")
+    print("  BikePoints...")
+    data = tfl_get("/BikePoint")
     if not data:
         return
 
     rows = []
     for station in data:
-        props = {
-            p["key"]: p["value"]
-            for p in station.get("additionalProperties", [])
-        }
-
-        # Calculate occupancy percentage — useful derived metric
-        # (what fraction of the station is occupied by bikes)
+        props = {p["key"]: p["value"] for p in station.get("additionalProperties", [])}
         try:
             bikes = int(props.get("NbBikes", 0))
             total = int(props.get("NbDocks", 0))
-            occupancy_pct = round((bikes / total * 100), 1) if total > 0 else None
+            occ   = round(bikes / total * 100, 1) if total > 0 else None
         except (ValueError, TypeError, ZeroDivisionError):
-            occupancy_pct = None
+            occ = None
 
         rows.append({
             "captured_at":       captured_at,
@@ -304,179 +317,332 @@ def capture_bikepoints(bucket, captured_at: str):
             "e_bikes_available": props.get("NbEBikes"),
             "docks_available":   props.get("NbEmptyDocks"),
             "total_docks":       props.get("NbDocks"),
-            "occupancy_pct":     occupancy_pct,
+            "occupancy_pct":     occ,
             "is_installed":      props.get("Installed"),
             "is_locked":         props.get("Locked"),
             "is_temporary":      props.get("Temporary"),
         })
-
-    upload_to_gcs(bucket, rows, "bikepoints", captured_at)
+    upload(bucket, rows, "bikepoints", captured_at)
 
 
 def capture_road_disruptions(bucket, captured_at: str):
     """
-    Captures active road disruptions across the TfL road network.
+    ACTIVE ROAD DISRUPTIONS on the TfL road network.
 
-    Unlike line status (which is always a full snapshot of current state),
-    disruptions have their own lifecycle — they start, persist across multiple
-    captures, and eventually end. A disruption lasting 3 days will appear in
-    ~864 captures (every 5 min for 3 days).
+    Disruptions have their own lifecycle — they persist across multiple
+    captures. The disruption_id links the same disruption across runs,
+    letting you calculate true duration:
+      MAX(captured_at) - MIN(captured_at) WHERE disruption_id = X
 
-    This lets you do two types of analysis:
-      1. Point-in-time: how many disruptions were active at 8am on a Monday?
-      2. Duration: how long did this specific disruption last?
-         (max(captured_at) - min(captured_at) where disruption_id = X)
+    When there are no disruptions (common overnight), we write a sentinel
+    row so we know the capture ran successfully with zero active disruptions.
 
-    The disruption_id field is the link between captures — same disruption
-    across multiple runs will have the same ID.
-
-    Frequency: every 5 minutes
-    Typical rows per call: 10–500 (varies enormously by time of day/week)
+    Typically 10–500 rows per call depending on time of day.
     """
-    print("Capturing road disruptions...")
+    print("  Road disruptions...")
+    data = tfl_get("/Road/all/Disruption")
 
-    data = call_tfl("/Road/all/Disruption")
-
-    # No disruptions is a valid and common state (especially overnight)
-    # We still write a file so we know the capture ran — just with a
-    # sentinel row so the absence of disruptions is recorded
     if not data:
-        rows = [{
-            "captured_at":       captured_at,
-            "disruption_id":     "NO_ACTIVE_DISRUPTIONS",
-            "category":          "",
-            "sub_category":      "",
-            "description":       "",
-            "location":          "",
-            "lat":               None,
-            "lng":               None,
-            "severity":          "",
-            "is_blocking":       None,
-            "streets_affected":  "",
-            "start_date":        "",
-            "end_date":          "",
-            "last_modified":     "",
-        }]
-        upload_to_gcs(bucket, rows, "road_disruptions", captured_at)
+        rows = [{"captured_at": captured_at, "disruption_id": "NO_ACTIVE_DISRUPTIONS",
+                 "category": "", "sub_category": "", "description": "",
+                 "location": "", "lat": None, "lng": None,
+                 "severity": "", "is_blocking": None,
+                 "streets_affected": "", "start_date": "", "end_date": ""}]
+        upload(bucket, rows, "road_disruptions", captured_at)
         return
 
     rows = []
     for d in data:
-        # Extract coordinates if available
-        lat, lng = None, None
-        coords   = d.get("geography", {}) or {}
-        if coords.get("type") == "Point":
-            coords_list = coords.get("coordinates", [])
-            if len(coords_list) >= 2:
-                lng, lat = coords_list[0], coords_list[1]  # GeoJSON is [lng, lat]
-
-        streets = d.get("streets", []) or []
-        street_names = ", ".join(
-            s.get("name", "") for s in streets if s.get("name")
-        )
+        # GeoJSON coordinates are [lng, lat] — note the reversal
+        coords = (d.get("geography") or {}).get("coordinates", [])
+        lat = coords[1] if len(coords) >= 2 else None
+        lng = coords[0] if len(coords) >= 2 else None
 
         rows.append({
             "captured_at":      captured_at,
             "disruption_id":    d.get("id", ""),
             "category":         d.get("category", ""),
             "sub_category":     d.get("subCategory", ""),
-            "description":      (d.get("description", "") or "").replace("\n", " "),
+            "description":      (d.get("description") or "").replace("\n", " "),
             "location":         d.get("location", ""),
             "lat":              lat,
             "lng":              lng,
             "severity":         d.get("severity", ""),
             "is_blocking":      d.get("isBlocking"),
-            "streets_affected": street_names,
+            "streets_affected": ", ".join(s.get("name","") for s in (d.get("streets") or []) if s.get("name")),
             "start_date":       d.get("startDate", ""),
             "end_date":         d.get("endDate", ""),
-            "last_modified":    d.get("lastModified", ""),
         })
-
-    upload_to_gcs(bucket, rows, "road_disruptions", captured_at)
+    upload(bucket, rows, "road_disruptions", captured_at)
 
 
 def capture_air_quality(bucket, captured_at: str):
     """
-    Captures London air quality index from TfL.
+    LONDON AIR QUALITY FORECAST from TfL.
 
-    TfL publishes a daily air quality forecast — today's and tomorrow's
-    expected air quality across London. The forecast is updated daily so
-    capturing it every 5 minutes is redundant — but because the overall
-    script runs every 5 minutes, this runs with it. The files will be
-    largely identical within the same day, which is fine — deduplicate
-    in dbt later using DATE(captured_at).
+    Returns today's and tomorrow's forecast. Updated daily by TfL.
+    Bands: Low / Moderate / High / Very High (UK DAQI standard).
 
-    The band values are: Low / Moderate / High / Very High
-    These map to the UK Daily Air Quality Index (DAQI) standard.
+    Analytical use: correlate air quality bands with BikePoint hire rates.
+    Hypothesis: High/Very High air quality suppresses cycling demand.
 
-    Key analytical use: correlate air quality with BikePoint hire rates.
-    Hypothesis: bad air quality (High/Very High) reduces bike hire demand.
-
-    Frequency: every 5 minutes (but data only changes daily)
-    Typical rows per call: 2 (today + tomorrow)
+    Only 2 rows per call (today + tomorrow).
     """
-    print("Capturing air quality...")
-
-    data = call_tfl("/AirQuality")
+    print("  Air quality...")
+    data = tfl_get("/AirQuality")
     if not data:
         return
 
     rows = []
-    for forecast in data.get("currentForecast", []):
+    for f in data.get("currentForecast", []):
         rows.append({
             "captured_at":      captured_at,
-            "forecast_type":    forecast.get("forecastBand", ""),    # 'today' or 'tomorrow'
-            "forecast_summary": (forecast.get("forecastSummary", "") or "").replace("\n", " "),
-            "forecast_text":    (forecast.get("forecastText", "") or "").replace("\n", " "),
-            "no2_band":         forecast.get("nO2Band", ""),
-            "o3_band":          forecast.get("o3Band", ""),
-            "pm10_band":        forecast.get("pM10Band", ""),
-            "pm25_band":        forecast.get("pM25Band", ""),
-            "so2_band":         forecast.get("sO2Band", ""),
+            "forecast_type":    f.get("forecastBand", ""),
+            "forecast_summary": (f.get("forecastSummary") or "").replace("\n", " "),
+            "forecast_text":    (f.get("forecastText") or "").replace("\n", " "),
+            "no2_band":         f.get("nO2Band", ""),
+            "o3_band":          f.get("o3Band", ""),
+            "pm10_band":        f.get("pM10Band", ""),
+            "pm25_band":        f.get("pM25Band", ""),
+            "so2_band":         f.get("sO2Band", ""),
         })
+    upload(bucket, rows, "air_quality", captured_at)
 
-    upload_to_gcs(bucket, rows, "air_quality", captured_at)
+
+def capture_tube_arrivals(bucket, captured_at: str):
+    """
+    ── NEW IN V2 ──
+    LIVE NEXT-TRAIN PREDICTIONS for every Tube, DLR, Overground,
+    and Elizabeth line — one call per line.
+
+    This is more granular than line_status:
+      - line_status tells you WHETHER there's a problem
+      - tube_arrivals tells you actual train frequency and wait times
+
+    Key fields:
+      line_id           — e.g. 'central', 'jubilee'
+      vehicle_id        — unique train ID (tracks individual trains)
+      station_name      — where the train is predicted to arrive
+      destination_name  — where the train is heading
+      expected_arrival  — predicted arrival time (ISO8601)
+      time_to_station   — seconds until arrival (TfL's live estimate)
+      current_location  — plain text location of train right now
+      direction         — 'inbound' or 'outbound'
+
+    Analytical uses:
+      - Calculate actual headway (gap between trains) per line per hour
+      - Compare scheduled vs actual frequency
+      - Detect knock-on effects of disruptions on train spacing
+      - Peak vs off-peak frequency analysis
+
+    ~100–500 rows per line per call. Total: ~3,000–7,000 rows per run.
+    We loop through all 14 lines — each is one separate API call.
+    If one line fails, we continue with the others.
+    """
+    print("  Tube arrivals (all lines)...")
+    all_rows = []
+
+    for line_id in TUBE_LINES:
+        data = tfl_get(f"/Line/{line_id}/Arrivals")
+        if not data:
+            continue  # skip this line if API call failed, try next line
+
+        for train in data:
+            all_rows.append({
+                "captured_at":      captured_at,
+                "line_id":          line_id,
+                "vehicle_id":       train.get("vehicleId", ""),
+                "naptan_id":        train.get("naptanId", ""),
+                "station_name":     train.get("stationName", ""),
+                "platform_name":    train.get("platformName", ""),
+                "destination_id":   train.get("destinationNaptanId", ""),
+                "destination_name": train.get("destinationName", ""),
+                "direction":        train.get("direction", ""),
+                "current_location": train.get("currentLocation", ""),
+                "expected_arrival": train.get("expectedArrival", ""),
+                "time_to_station":  train.get("timeToStation"),    # seconds
+                "timing_source":    train.get("timing", {}).get("source", "") if train.get("timing") else "",
+            })
+
+    print(f"    → {len(all_rows):,} arrival predictions across {len(TUBE_LINES)} lines")
+    upload(bucket, all_rows, "tube_arrivals", captured_at)
+
+
+def capture_bus_arrivals(bucket, captured_at: str):
+    """
+    ── NEW IN V2 ──
+    LIVE BUS ARRIVAL PREDICTIONS at the 50 busiest London bus stops.
+
+    Why 50 stops and not all 19,600?
+      Capturing all stops every 5 min = 19,600 API calls per run.
+      At 500 requests/min (TfL free tier limit) that takes 39 minutes per run.
+      Completely impossible at 5-minute intervals.
+
+      50 stops = 50 API calls per run = ~6 seconds total. Perfectly feasible.
+      These 50 stops cover major interchanges, transport hubs, and high-volume
+      locations across all zones — a representative sample of London bus demand.
+
+    Key fields:
+      stop_id           — NaPTAN ID of the bus stop
+      stop_name         — human-readable stop name (from our lookup dict)
+      line_id           — bus route number e.g. '25', '73', '38'
+      vehicle_id        — unique bus ID (tracks individual buses)
+      destination_name  — where the bus is going
+      expected_arrival  — predicted arrival time (ISO8601)
+      time_to_station   — seconds until bus arrives at this stop
+      towards           — direction description e.g. 'Oxford Circus'
+
+    Analytical uses:
+      - Bus punctuality: is the bus on time vs scheduled?
+      - Frequency analysis: how many buses per hour per route?
+      - Peak crowding proxy: many buses waiting = high demand stop
+      - Compare bus reliability across different areas of London
+
+    ~5–30 rows per stop per call. Total: ~500–1,500 rows per run.
+    Each stop is one API call. We continue if any individual stop fails.
+    """
+    print(f"  Bus arrivals ({len(BUS_STOPS)} stops)...")
+    all_rows      = []
+    failed_stops  = 0
+
+    for stop_id, stop_name in BUS_STOPS.items():
+        data = tfl_get(f"/StopPoint/{stop_id}/Arrivals")
+        if data is None:
+            failed_stops += 1
+            continue  # skip this stop if call failed
+
+        for bus in data:
+            all_rows.append({
+                "captured_at":      captured_at,
+                "stop_id":          stop_id,
+                "stop_name":        stop_name,
+                "line_id":          bus.get("lineName", ""),        # route number e.g. '73'
+                "line_name":        bus.get("lineId", ""),          # e.g. '73' (same as lineName for buses)
+                "vehicle_id":       bus.get("vehicleId", ""),
+                "destination_name": bus.get("destinationName", ""),
+                "towards":          bus.get("towards", ""),
+                "direction":        bus.get("direction", ""),
+                "expected_arrival": bus.get("expectedArrival", ""),
+                "time_to_station":  bus.get("timeToStation"),       # seconds
+                "timing_source":    bus.get("timing", {}).get("source", "") if bus.get("timing") else "",
+                "operator":         bus.get("operatorName", ""),
+            })
+
+    if failed_stops > 0:
+        print(f"    → {failed_stops} stops failed (API errors) — skipped")
+    print(f"    → {len(all_rows):,} bus arrival predictions")
+    upload(bucket, all_rows, "bus_arrivals", captured_at)
+
+
+def capture_road_speeds(bucket, captured_at: str):
+    """
+    ── NEW IN V2 ──
+    LIVE TRAFFIC SPEEDS on TfL-managed roads (Red Routes).
+
+    Red Routes are the ~5% of London roads that carry ~30% of all traffic.
+    TfL manages them directly and publishes live speed and flow data.
+
+    Why this matters:
+      - Congestion severity: is the road flowing freely or blocked?
+      - Correlate with road disruptions: does a nearby incident slow traffic?
+      - Time-of-day patterns: rush hour vs off-peak speed profiles
+      - Weather impact: does rain slow traffic on specific corridors?
+
+    Key fields:
+      road_id           — TfL road ID e.g. 'A1', 'A40', 'A406'
+      link_id           — specific road segment ID
+      point_id          — measurement point on the road
+      speed             — current speed in mph
+      flow              — vehicles per hour (traffic volume)
+      travelTime        — journey time in minutes for this segment
+
+    Note: Not all road IDs return speed data — some only have disruption data.
+    We capture whatever the API returns and skip silently if nothing comes back.
+
+    ~10–50 rows per road per call. Total: ~200–1,000 rows per run.
+    """
+    print(f"  Road traffic speeds ({len(ROAD_IDS)} roads)...")
+    all_rows = []
+
+    for road_id in ROAD_IDS:
+        # Try the speed endpoint — not all roads have this data
+        data = tfl_get(f"/Road/{road_id}/Speed")
+        if not data:
+            continue
+
+        # Speed data can come back as a dict or a list depending on the road
+        if isinstance(data, dict):
+            data = [data]
+
+        for segment in data:
+            all_rows.append({
+                "captured_at":   captured_at,
+                "road_id":       road_id,
+                "link_id":       segment.get("linkId", ""),
+                "point_id":      segment.get("pointId", ""),
+                "speed":         segment.get("speed"),          # mph
+                "flow":          segment.get("flow"),           # vehicles/hour
+                "travel_time":   segment.get("travelTime"),     # minutes
+                "road_name":     segment.get("roadName", ""),
+                "direction":     segment.get("direction", ""),
+            })
+
+    print(f"    → {len(all_rows):,} speed measurements")
+    if all_rows:
+        upload(bucket, all_rows, "road_speeds", captured_at)
+    else:
+        # Road speed endpoint can be unreliable — don't upload empty file
+        print("    → No speed data returned (endpoint may be intermittent)")
 
 
 # ─── MAIN ────────────────────────────────────────────────────────────────────
 
 def main():
-    # Single timestamp for the entire run
-    # Every row written in this run shares this exact captured_at value
-    # This is the glue that lets you join line_status + bikepoints + disruptions
-    # from the same 5-minute window when analysing in Snowflake later
-    captured_at = get_timestamp()
+    # ── Single timestamp for the ENTIRE run ──────────────────────────────────
+    # This is the most important line in the script.
+    # Every row from every endpoint in this run shares this exact captured_at.
+    # This is what lets you join line_status + bikepoints + tube_arrivals
+    # + bus_arrivals + road_speeds from the same 5-minute window in Snowflake.
+    # Without this, you can't know which observations are contemporaneous.
+    captured_at = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
-    print(f"\n{'='*55}")
-    print(f"TfL Capture Run  →  GCS")
+    print(f"\n{'='*60}")
+    print(f"TfL Capture v2  →  GCS")
     print(f"Timestamp : {captured_at}")
     print(f"Bucket    : gs://{GCS_BUCKET}")
-    print(f"{'='*55}")
+    print(f"Endpoints : 7  (4 original + 3 new)")
+    print(f"{'='*60}\n")
 
-    # Validate environment before doing anything
-    missing = []
-    if not TFL_APP_KEY:   missing.append("TFL_APP_KEY")
-    if not GCS_BUCKET:    missing.append("GCS_BUCKET_NAME")
-    if not os.environ.get("GCP_CREDENTIALS"): missing.append("GCP_CREDENTIALS")
-
+    # ── Validate environment variables ───────────────────────────────────────
+    missing = [
+        v for v in ["TFL_APP_KEY", "GCS_BUCKET_NAME", "GCP_CREDENTIALS"]
+        if not os.environ.get(v)
+    ]
     if missing:
-        print(f"\n  ERROR: Missing environment variables: {', '.join(missing)}")
-        print("  These must be set as GitHub Secrets.")
+        print(f"ERROR: Missing GitHub Secrets: {', '.join(missing)}")
         raise SystemExit(1)
 
-    # Authenticate to GCS once — reuse the same client for all four uploads
-    _, bucket = get_gcs_client()
+    # ── Authenticate to GCS once, reuse for all uploads ─────────────────────
+    bucket = get_gcs_bucket()
     if not bucket:
-        print("\n  ERROR: Could not connect to GCS. Check GCP_CREDENTIALS.")
+        print("ERROR: Could not connect to GCS. Check GCP_CREDENTIALS secret.")
         raise SystemExit(1)
 
-    # Run all four capture functions
+    # ── Run all 7 capture functions ──────────────────────────────────────────
+    # Original 4
     capture_line_status(bucket, captured_at)
     capture_bikepoints(bucket, captured_at)
     capture_road_disruptions(bucket, captured_at)
     capture_air_quality(bucket, captured_at)
 
-    print(f"\n✓ All done — {captured_at}\n")
+    # New 3
+    capture_tube_arrivals(bucket, captured_at)
+    capture_bus_arrivals(bucket, captured_at)
+    capture_road_speeds(bucket, captured_at)
+
+    print(f"\n{'='*60}")
+    print(f"✓ Complete — {captured_at}")
+    print(f"{'='*60}\n")
 
 
 if __name__ == "__main__":
