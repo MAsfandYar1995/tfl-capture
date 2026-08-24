@@ -1,0 +1,22 @@
+# NEVER commit these — credentials must stay out of git
+.env
+*.env
+secrets.py
+service_account*.json
+*credentials*.json
+gcp_key*.json
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+env/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# IDE
+.vscode/
+.idea/
