@@ -1,67 +1,28 @@
-# TfL → GCS Capture Pipeline
-# ============================
-# Runs every 5 minutes using GitHub Actions cron.
-# Calls the TfL API and writes JSON files directly to Google Cloud Storage.
-# No data is stored in the GitHub repo itself — only code lives here.
-#
-# Cost: £0
-#   - GitHub Actions: free on public repos (unlimited minutes)
-#   - GCS: free up to 5GB (Always Free, never expires)
-#   - TfL API: free with registration
-
 name: TfL → GCS Capture
 
 on:
   schedule:
-    # Every 5 minutes, all day every day
-    # Note: GitHub cron has ~1 minute jitter — this is fine for our purposes
     - cron: "*/5 * * * *"
-
-  # Lets you trigger manually from GitHub UI (Actions tab → Run workflow)
-  # Use this to test before waiting for the cron to fire
   workflow_dispatch:
 
 jobs:
   capture:
-    name: Capture and upload to GCS
+    name: Capture TfL data → GCS
     runs-on: ubuntu-latest
 
-    # Only run during TfL operating hours (05:00–01:00 UTC)
-    # Saves ~4 hours of pointless runs per night when trains/bikes aren't running
-    # Remove this condition if you want true 24/7 capture
-    if: |
-      github.event_name == 'workflow_dispatch' ||
-      (
-        format('{0}', github.event.schedule) != '' &&
-        (
-          fromJSON(format('{0}', github.event.schedule)) == null ||
-          true
-        )
-      )
-
     steps:
-      # 1. Check out your code
       - name: Checkout
         uses: actions/checkout@v4
 
-      # 2. Set up Python 3.11
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
-          # Cache pip dependencies so installs are fast after the first run
           cache: "pip"
 
-      # 3. Install dependencies
-      #    requests       — for calling the TfL API
-      #    google-cloud-storage — for writing to GCS
-      #    google-auth    — for authenticating with your service account
       - name: Install dependencies
         run: pip install requests google-cloud-storage google-auth
 
-      # 4. Run the capture script
-      #    All three secrets are passed as environment variables
-      #    GitHub automatically masks their values in all logs
       - name: Capture TfL data → GCS
         env:
           TFL_APP_KEY:     ${{ secrets.TFL_APP_KEY }}
@@ -69,8 +30,6 @@ jobs:
           GCP_CREDENTIALS: ${{ secrets.GCP_CREDENTIALS }}
         run: python scripts/capture.py
 
-      # 5. Print summary (optional — useful when checking runs manually)
       - name: Done
         if: always()
-        run: echo "Run complete at $(date -u '+%Y-%m-%dT%H:%M:%SZ')"
-        
+        run: echo "Finished at $(date -u '+%Y-%m-%dT%H:%M:%SZ')"
